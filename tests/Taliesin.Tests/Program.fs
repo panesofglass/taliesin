@@ -24,9 +24,7 @@ let tests =
                 customersSpec
             ])
 
-    let resourceManager = ResourceManager()
-    let subscription = resourceManager.Start(spec)
-    let client = resourceManager :> IObserver<_>
+    let resourceManager = new ResourceManager<_>(spec)
 
     testList "dyfrig" [
         testCase "valid GET /" <| fun _ ->
@@ -42,11 +40,11 @@ let tests =
                             requestProtocol = "HTTP/1.1",
                             requestHeaders = headers,
                             responseBody = (out :> Stream))
-            resourceManager.[Root].Sent |> Event.add (fun env ->
+            async {
+                do! resourceManager.AsyncInvoke env
                 let result = Encoding.ASCII.GetString(out.ToArray())
                 test <@ result = "Hello, root!" @>
-            )
-            client.OnNext(env)
+            } |> Async.RunSynchronously
 
         testCase "valid GET /about" <| fun _ ->
             let out = new MemoryStream()
@@ -61,11 +59,11 @@ let tests =
                             requestProtocol = "HTTP/1.1",
                             requestHeaders = headers,
                             responseBody = (out :> Stream))
-            resourceManager.[About].Sent |> Event.add (fun env ->
+            async {
+                do! resourceManager.AsyncInvoke env
                 let result = Encoding.ASCII.GetString(out.ToArray())
                 test <@ result = "Hello, about!" @>
-            )
-            client.OnNext(env)
+            } |> Async.RunSynchronously
 
         testCase "valid GET /customers" <| fun _ ->
             let out = new MemoryStream()
@@ -80,11 +78,11 @@ let tests =
                             requestProtocol = "HTTP/1.1",
                             requestHeaders = headers,
                             responseBody = (out :> Stream))
-            resourceManager.[About].Sent |> Event.add (fun env ->
+            async {
+                do! resourceManager.AsyncInvoke env
                 let result = Encoding.ASCII.GetString(out.ToArray())
                 test <@ result = "Hello, customers!" @>
-            )
-            client.OnNext(env)
+            } |> Async.RunSynchronously
 
         testCase "valid POST /customers" <| fun _ ->
             let out = new MemoryStream()
@@ -99,11 +97,11 @@ let tests =
                             requestProtocol = "HTTP/1.1",
                             requestHeaders = headers,
                             responseBody = (out :> Stream))
-            resourceManager.[About].Sent |> Event.add (fun env ->
+            async {
+                do! resourceManager.AsyncInvoke env
                 let result = Encoding.ASCII.GetString(out.ToArray())
                 test <@ result = "Created customer!" @>
-            )
-            client.OnNext(env)
+            } |> Async.RunSynchronously
 
         testCase "valid GET /customers/1" <| fun _ ->
             let out = new MemoryStream()
@@ -118,11 +116,11 @@ let tests =
                             requestProtocol = "HTTP/1.1",
                             requestHeaders = headers,
                             responseBody = (out :> Stream))
-            resourceManager.[About].Sent |> Event.add (fun env ->
+            async {
+                do! resourceManager.AsyncInvoke env
                 let result = Encoding.ASCII.GetString(out.ToArray())
                 test <@ result = "Hello, customer!" @>
-            )
-            client.OnNext(env)
+            } |> Async.RunSynchronously
 
         testCase "valid PUT /customers/1" <| fun _ ->
             let out = new MemoryStream()
@@ -137,11 +135,11 @@ let tests =
                             requestProtocol = "HTTP/1.1",
                             requestHeaders = headers,
                             responseBody = (out :> Stream))
-            resourceManager.[About].Sent |> Event.add (fun env ->
+            async {
+                do! resourceManager.AsyncInvoke env
                 let result = Encoding.ASCII.GetString(out.ToArray())
                 test <@ result = "Updated customer!" @>
-            )
-            client.OnNext(env)
+            } |> Async.RunSynchronously
     ]
 
 [<EntryPoint>]

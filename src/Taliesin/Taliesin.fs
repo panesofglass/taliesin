@@ -63,21 +63,20 @@ type Agent<'T> = MailboxProcessor<'T>
 
 /// Messages used by the HTTP resource agent.
 type internal ResourceMessage =
-    | Request of OwinEnv
+    | Request of OwinEnv * AsyncReplyChannel<unit>
     | SetHandler of HttpMethod * OwinAppFunc
-    | Error of exn
     | Shutdown
 
 /// An HTTP resource agent.
 type Resource(uriTemplate, allowedMethods: HttpMethod list, methodNotAllowedHandler) =
     let onError = new Event<exn>()
-    let onSending = new Event<OwinEnv>()
-    let onSent = new Event<OwinEnv>()
+    let onExecuting = new Event<OwinEnv>()
+    let onExecuted = new Event<OwinEnv>()
     let agent = Agent<ResourceMessage>.Start(fun inbox ->
         let rec loop allowedMethods (handlers: HttpMethodHandler list) = async {
             let! msg = inbox.Receive()
             match msg with
-            | Request(env) ->
+            | Request(env, channel) ->
                 let env = Environment.toEnvironment env
                 let owinEnv = env :> OwinEnv 
                 let foundHandler =
@@ -87,9 +86,12 @@ type Resource(uriTemplate, allowedMethods: HttpMethod list, methodNotAllowedHand
                     match foundHandler with
                     | Some(HttpMethodHandler(_, h)) -> h
                     | None -> methodNotAllowedHandler allowedMethods
-                onSending.Trigger(owinEnv)
-                do! selectedHandler.Invoke owinEnv |> Async.AwaitTask
-                onSent.Trigger(owinEnv)
+                onExecuting.Trigger owinEnv
+                let task = selectedHandler.Invoke owinEnv
+                do! task |> Async.AwaitTask
+                onExecuted.Trigger owinEnv
+                // TODO: Should return whether the task succeeded or failed.
+                channel.Reply()
                 return! loop allowedMethods handlers
             | SetHandler(httpMethod, handler) ->
                 let foundMethod = allowedMethods |> List.tryFind ((=) httpMethod)
@@ -102,23 +104,22 @@ type Resource(uriTemplate, allowedMethods: HttpMethod list, methodNotAllowedHand
                         handler :: otherHandlers
                     | None -> handlers
                 return! loop allowedMethods handlers'
-            | Error exn ->
-                onError.Trigger(exn)
-                return! loop allowedMethods handlers
             | Shutdown -> ()
         }
             
         loop allowedMethods []
     )
 
-    /// Connect the resource to the request event stream.
-    /// This method applies a default filter to subscribe only to events
-    /// matching the `Resource`'s `uriTemplate`.
-    // NOTE: This should be internal if used in a type provider.
-    abstract Connect : IObservable<OwinEnv> * (string -> OwinEnv -> bool) -> IDisposable
-    default x.Connect(observable, uriMatcher) =
-        let uriMatcher = uriMatcher uriTemplate
-        (Observable.filter uriMatcher observable).Subscribe(x)
+    /// The URI template for this `Resource`.
+    member x.UriTemplate = uriTemplate
+
+    /// Invokes the `Resource` and asynchronously waits for the completion.
+    member x.AsyncInvoke(env) =
+        agent.PostAndAsyncReply(fun channel -> Request(env, channel))
+
+    /// Invokes the `Resource` as an OWIN handler.
+    member x.Invoke : OwinAppFunc =
+        Func<_,_>(fun env -> x.AsyncInvoke env |> Async.StartAsTask :> Task)
 
     /// Sets the handler for the specified `HttpMethod`.
     /// Ideally, we would expose methods matching the allowed methods.
@@ -131,18 +132,12 @@ type Resource(uriTemplate, allowedMethods: HttpMethod list, methodNotAllowedHand
     /// Provide stream of `exn` for logging purposes.
     [<CLIEvent>]
     member x.Error = onError.Publish
-    /// Provide stream of environments before handling the response.
+    /// Provide stream of environments before executing the request handler.
     [<CLIEvent>]
-    member x.Sending = onSending.Publish
-    /// Provide stream of environments after handling the request.
+    member x.Executing = onExecuting.Publish
+    /// Provide stream of environments after the request handler is executed.
     [<CLIEvent>]
-    member x.Sent = onSent.Publish
-
-    /// Implement `IObserver` to allow the `Resource` to subscribe to the request event stream.
-    interface IObserver<OwinEnv> with
-        member x.OnNext(value) = agent.Post <| Request value
-        member x.OnError(exn) = agent.Post <| Error exn
-        member x.OnCompleted() = agent.Post Shutdown
+    member x.Executed = onExecuted.Publish
 
 
 /// Type alias for URI templates
@@ -167,24 +162,33 @@ type RouteSpec<'TRoute> =
     | RouteLeaf of RouteDef<'TRoute>
     | RouteNode of RouteDef<'TRoute> * RouteSpec<'TRoute> list
 
+[<CompilationRepresentation(CompilationRepresentationFlags.ModuleSuffix)>]
+module RouteSpec =
+    let tryFind requestUri =
+        // TODO: implement n-ary tree walker
+        // TODO: break apart pieces of the URI as each node of the tree is found.
+        // TODO: parse and match types specified in URI templates
+        ()
+
 /// Default implementations of the 405 handler and URI matcher
 [<CompilationRepresentation(CompilationRepresentationFlags.ModuleSuffix)>]
 module internal ResourceManager =
     open Dyfrig
 
-    let notAllowed (allowedMethods: HttpMethod list) =
-        Func<_,_>(fun env ->
-            let env = Environment.toEnvironment env
-            env.ResponseStatusCode <- 405
-            let bytes =
-                allowedMethods
-                |> List.fold (fun a b -> a + " " + b.ToString()) ""
-                |> sprintf "405 Method Not Allowed. Try one of %s"
-                |> System.Text.Encoding.ASCII.GetBytes
-            async {
-                do! env.ResponseBody.AsyncWrite(bytes)
-            } |> Async.StartAsTask :> Task)
+    /// Default 405 Method Not Allowed OWIN handler
+    let notAllowed (allowedMethods: HttpMethod list) = Func<_,_>(fun env ->
+        let env = Environment.toEnvironment env
+        env.ResponseStatusCode <- 405
+        let bytes =
+            allowedMethods
+            |> List.fold (fun a b -> a + " " + b.ToString()) ""
+            |> sprintf "405 Method Not Allowed. Try one of %s"
+            |> System.Text.Encoding.ASCII.GetBytes
+        async {
+            do! env.ResponseBody.AsyncWrite(bytes)
+        } |> Async.StartAsTask :> Task)
 
+    /// Default URI matching algorithm
     let uriMatcher uriTemplate env =
         let env = Environment.toEnvironment env
         // TODO: Do this with F# rather than System.ServiceModel. This could easily use a Regex pattern.
@@ -198,6 +202,36 @@ module internal ResourceManager =
         env.Add("taliesin.UriTemplateMatch", result) |> ignore
         true
 
+    /// Helper function to concatenate URI templates during `ResourceManager` construction.
+    let concatUriTemplate baseTemplate template =
+        if String.IsNullOrEmpty baseTemplate then template else baseTemplate + "/" + template
+
+    /// Helper function to append a new `Resource` to the list of managed resources.
+    let addResource resources name uriTemplate allowedMethods notAllowed =
+        let resource = new Resource(uriTemplate, allowedMethods, notAllowed)
+        (name, resource) :: resources
+
+    /// Flattens the provided `RouteSpec` into a list of named `Resource`s.
+    let rec addResources uriTemplate notAllowed resources = function
+        | RouteNode((name, template, httpMethods), nestedRoutes) ->
+            let uriTemplate' = concatUriTemplate uriTemplate template
+            let resources' = addResource resources name uriTemplate' httpMethods notAllowed
+            addNestedResources uriTemplate' notAllowed resources' nestedRoutes
+        | RouteLeaf(name, template, httpMethods) ->
+            let uriTemplate' = concatUriTemplate uriTemplate template
+            addResource resources name uriTemplate' httpMethods notAllowed
+
+    /// Flattens nested members in the provided `RouteSpec`.
+    and addNestedResources uriTemplate notAllowed resources routes =
+        match routes with
+        | [] -> resources
+        | route::routes ->
+            let resources' = addResources uriTemplate notAllowed resources route
+            match routes with
+            | [] -> resources'
+            | _ -> addNestedResources uriTemplate notAllowed resources' routes
+
+
 /// Manages traffic flow within the application to specific routes.
 /// Connect resource handlers using:
 ///     let app = ResourceManager<HttpRequestMessage, HttpResponseMessage, Routes>(spec)
@@ -205,74 +239,45 @@ module internal ResourceManager =
 /// A type provider could make this much nicer, e.g.:
 ///     let app = ResourceManager<"path/to/spec/as/string">
 ///     app.Root.Get(fun request -> async { return response })
-type ResourceManager<'TRoute when 'TRoute : equality>(?uriMatcher, ?methodNotAllowedHandler) =
+type ResourceManager<'TRoute when 'TRoute : equality>(routeSpec, ?uriMatcher, ?methodNotAllowedHandler) as x =
     // Should this also be an Agent<'T>?
     inherit Dictionary<'TRoute, Resource>(HashIdentity.Structural)
 
     let uriMatcher = defaultArg uriMatcher ResourceManager.uriMatcher
     let methodNotAllowedHandler = defaultArg methodNotAllowedHandler ResourceManager.notAllowed
 
-    let onRequest = new Event<OwinEnv>()
     let onError = new Event<exn>()
+    let onExecuting = new Event<OwinEnv>()
+    let onExecuted = new Event<OwinEnv>()
 
-    let apply manager resources subscriptions name uriTemplate allowedMethods =
-        let resource = new Resource(uriTemplate, allowedMethods, methodNotAllowedHandler)
-        let resources' = (name, resource) :: resources
-        let subscriptions' = resource.Connect(manager, uriMatcher) :: subscriptions
-        resources', subscriptions'
-
-    let concatUriTemplate baseTemplate template =
-        if String.IsNullOrEmpty baseTemplate then template else baseTemplate + "/" + template
-
-    let rec applyRouteSpec manager uriTemplate resources subscriptions = function
-        | RouteNode((name, template, httpMethods), nestedRoutes) ->
-            let uriTemplate' = concatUriTemplate uriTemplate template
-            let resources', subscriptions' = apply manager resources subscriptions name uriTemplate' httpMethods
-            applyNestedRoutes manager uriTemplate' resources' subscriptions' nestedRoutes
-        | RouteLeaf(name, template, httpMethods) ->
-            let uriTemplate' = concatUriTemplate uriTemplate template
-            apply manager resources subscriptions name uriTemplate' httpMethods
-
-    and applyNestedRoutes manager uriTemplate resources subscriptions routes =
-        match routes with
-        | [] -> resources, subscriptions
-        | route::routes ->
-            let resources', subscriptions' = applyRouteSpec manager uriTemplate resources subscriptions route
-            match routes with
-            | [] -> resources', subscriptions'
-            | _ -> applyNestedRoutes manager uriTemplate resources' subscriptions' routes
-
-    member x.Start(routeSpec: RouteSpec<_>) =
-        // TODO: This should probably manage a supervising agent of its own.
-        let resources, subscriptions = applyRouteSpec x "" [] [] routeSpec
-        for name, resource in resources do x.Add(name, resource)
-        { new IDisposable with
-            member __.Dispose() =
-                // Dispose all current event subscriptions.
-                for (disposable: IDisposable) in subscriptions do disposable.Dispose()
-                // Shutdown all resource agents.
-                for resource in x.Values do resource.Shutdown()
-        }
+    // TODO: This should probably manage a supervising agent of its own.
+    let resources = ResourceManager.addResources "" methodNotAllowedHandler [] routeSpec
+    do for name, resource in resources do x.Add(name, resource)
 
     [<CLIEvent>]
     member x.Error = onError.Publish
+    [<CLIEvent>]
+    member x.Executing = onExecuting.Publish
+    [<CLIEvent>]
+    member x.Executed = onExecuted.Publish
 
-    interface IObservable<OwinEnv> with
-        member x.Subscribe(observer) = onRequest.Publish.Subscribe(observer)
+    /// Asynchronously invokes the `ResourceManager` with the specified `OwinEnv`.
+    member x.AsyncInvoke(env: OwinEnv) = async {
+        let env = Environment.toEnvironment env
+        // TODO: Switch to RouteSpec.tryFind to traverse RouteSpec to find matching resource
+        let foundResource =
+            resources |> List.tryFind (fun (_, r) -> uriMatcher r.UriTemplate env)
+        match foundResource with
+        | Some (_, resource) ->
+            do! resource.AsyncInvoke env
+        | None ->
+            env.ResponseStatusCode <- 404
+    }
 
-    interface IObserver<OwinEnv> with
-        member x.OnNext(value) = onRequest.Trigger(value)
-        member x.OnError(exn) = onError.Trigger(exn)
-        member x.OnCompleted() = ()
+    /// Invokes the `ResourceManager` as an OWIN application.
+    member x.Invoke : OwinAppFunc =
+        Func<_,_>(fun env -> x.AsyncInvoke env |> Async.StartAsTask :> Task)
 
-
-module Owin =
-    let router<'TRoute when 'TRoute : equality> routeSpec : OwinApp =
-        let manager = ResourceManager<'TRoute>()
-        let subscription = manager.Start routeSpec
-        let client = manager :> IObserver<_>
-        fun env -> async {
-            // When and how to dispose the subscription?
-            client.OnNext(env)
-            // NOTE: This is not a valid OWIN application. The Async block will complete before the request is handled.
-        }
+    interface IDisposable with
+        /// Shutdown all resource agents.
+        member x.Dispose() = for resource in x.Values do resource.Shutdown()
